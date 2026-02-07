@@ -821,6 +821,7 @@ void OnTick()
    // V7.6 Fixes
    CheckPositionAgeTimeout();
    ManageTrailingTP();
+      CleanupExpiredPendingStopOrders();
    //--- Expiry check
    if(IsEAExpired())
    {
@@ -1010,6 +1011,87 @@ bool IsOurPosition(ulong ticket)
    if(PositionGetInteger(POSITION_MAGIC) != INPUT_MAGIC_NUMBER)
       return false;
    return true;
+}
+//--- Helper: returns true only if the pending order belongs to this EA
+bool IsOurPendingOrder(ulong ticket)
+{
+   if(!OrderSelect(ticket))
+      return false;
+   if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+      return false;
+   if(OrderGetInteger(ORDER_MAGIC) != INPUT_MAGIC_NUMBER)
+      return false;
+
+   ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+   if(type != ORDER_TYPE_BUY_STOP && type != ORDER_TYPE_SELL_STOP)
+      return false;
+
+   return true;
+}
+//--- Count existing pending stop orders by direction (1=BUY, -1=SELL)
+int CountPendingStopsByDirection(int direction)
+{
+   int count = 0;
+   int total = OrdersTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(!IsOurPendingOrder(ticket)) continue;
+
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      int orderDir = (type == ORDER_TYPE_BUY_STOP) ? 1 : -1;
+      if(orderDir == direction)
+         count++;
+   }
+   return count;
+}
+//--- Remove expired pending stop orders and log event
+void CleanupExpiredPendingStopOrders()
+{
+   int total = OrdersTotal();
+   datetime now = TimeCurrent();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(!IsOurPendingOrder(ticket)) continue;
+
+      datetime expiry = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+      if(expiry <= 0 || expiry > now)
+         continue;
+
+      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      Print("PENDING STOP EXPIRED: Ticket=", ticket,
+            " | Type=", EnumToString(type),
+            " | Expiry=", TimeToString(expiry, TIME_DATE|TIME_SECONDS),
+            " | Now=", TimeToString(now, TIME_DATE|TIME_SECONDS));
+
+      MqlTradeRequest request;
+      MqlTradeResult result;
+      ZeroMemory(request);
+      ZeroMemory(result);
+
+      request.action = TRADE_ACTION_REMOVE;
+      request.order = ticket;
+      request.symbol = _Symbol;
+      request.magic = INPUT_MAGIC_NUMBER;
+      request.comment = "PENDING_EXPIRED_CLEANUP";
+
+      bool sent = OrderSend(request, result);
+      if(sent && result.retcode == TRADE_RETCODE_DONE)
+      {
+         Print("PENDING STOP CANCELED: Ticket=", ticket,
+               " | Type=", EnumToString(type),
+               " | Reason=Expired");
+      }
+      else
+      {
+         Print("PENDING STOP CANCEL FAILED: Ticket=", ticket,
+               " | Retcode=", result.retcode,
+               " | Comment=", result.comment);
+      }
+   }
 }
 //--- Count only MAIN positions (exclude recovery/avg/hedge/etc.)
 int CountMainPositionsFromBroker()
@@ -2555,12 +2637,15 @@ bool CheckAllGates(string &rejectReason)
        if(posDir == direction)
           sameCount++;
     }
+        if(INPUT_EXECUTION_MODE == PENDING_STOP)
+       sameCount += CountPendingStopsByDirection(direction);
+
     
     if(sameCount >= INPUT_MAX_SAME_DIRECTION)
     {
-       rejectReason = "Same-direction limit reached (" + IntegerToString(sameCount) + 
-                      " " + (direction == 1 ? "BUY" : "SELL") + " positions)";
-       return false;
+             rejectReason = "Same-direction limit reached (" + IntegerToString(sameCount) +
+                      " " + (direction == 1 ? "BUY" : "SELL") +
+                      (INPUT_EXECUTION_MODE == PENDING_STOP ? " positions+pending" : " positions") + ")";
     }
     return true;
  }
@@ -2762,6 +2847,15 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
 //+------------------------------------------------------------------+
 bool PlacePendingStopOrder(const DecisionResult &decision, string comment)
 {
+   int pendingSameDirection = CountPendingStopsByDirection(decision.direction);
+   if(pendingSameDirection > 0)
+   {
+      Print("PENDING STOP SKIPPED (DUPLICATE): Symbol=", _Symbol,
+            " | Magic=", INPUT_MAGIC_NUMBER,
+            " | Direction=", (decision.direction == 1 ? "BUY" : "SELL"),
+            " | ExistingPending=", pendingSameDirection);
+      return false;
+   }
    MqlTradeRequest request;
    MqlTradeResult result;
    ZeroMemory(request);
