@@ -3525,23 +3525,25 @@ int GetSessionFromTime(datetime ts)
 //+------------------------------------------------------------------+
 void RecordClosedDealData(ulong dealTicket, double netProfit)
 {
-   string filename = _Symbol + "_" + IntegerToString(INPUT_MAGIC_NUMBER) + "_closed_deals.csv";
+   string symbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+   long magic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+   string filename = symbol + "_" + IntegerToString((int)magic) + "_closed_deals.csv";
    bool newFile = !FileIsExist(filename);
    int handle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return;
 
    if(newFile)
    {
-      FileWrite(handle, "DealTicket", "PositionID", "Magic", "Symbol", "CloseTime", "Direction",
-                "NetProfit", "SignalCombination", "Confidence", "Threat", "MTFScore", "Session", "Regime");
+      FileWrite(handle,
+                "Symbol", "Magic", "DealTicket", "PositionID", "Direction", "NetProfit",
+                "SignalCombination", "Confidence", "Threat", "MTF", "Session", "Regime", "Timestamp");
    }
 
    FileSeek(handle, 0, SEEK_END);
 
-   ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
    datetime closeTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
    ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
-
    // For close deals, DEAL_TYPE is usually opposite side of original entry.
    int direction = (dealType == DEAL_TYPE_SELL) ? 1 : -1;
    string signalCombination = "";
@@ -3566,12 +3568,11 @@ void RecordClosedDealData(ulong dealTicket, double netProfit)
 
    int session = GetSessionFromTime(sessionRefTime);
 
-   FileWrite(handle,
+  FileWrite(handle,
+      symbol,
+      magic,
       dealTicket,
       posId,
-      INPUT_MAGIC_NUMBER,
-      _Symbol,
-      closeTime,
       direction,
       netProfit,
       signalCombination,
@@ -3579,7 +3580,8 @@ void RecordClosedDealData(ulong dealTicket, double netProfit)
       threat,
       mtfScore,
       session,
-      (int)g_currentRegime);
+      (int)g_currentRegime,
+      closeTime);
 
    FileClose(handle);
 }
