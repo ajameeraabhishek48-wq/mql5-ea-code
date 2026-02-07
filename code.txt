@@ -2389,11 +2389,22 @@ bool CheckAllGates(string &rejectReason)
       Print("WARNING: maxPositions was 0 or negative! Reset to ", INPUT_MAX_CONCURRENT_TRADES);
    }
    
-     bool isTesterMode = (MQLInfoInteger(MQL_TESTER) != 0);
-   if(!isTesterMode && !TerminalInfoInteger(TERMINAL_CONNECTED))
+      bool isTesterMode = (MQLInfoInteger(MQL_TESTER) != 0);
+   if(isTesterMode)
    {
-      rejectReason = "Terminal disconnected";
-      return false;
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE CHECK: TERMINAL_CONNECTED skipped (tester mode)");
+   }
+   else
+   {
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE CHECK: TERMINAL_CONNECTED evaluated (live mode)");
+
+      if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+      {
+         rejectReason = "Terminal disconnected";
+         return false;
+      }
    }
    
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
