@@ -354,6 +354,20 @@ struct TrainingData
    int      rlState;
    ENUM_RL_ACTION rlAction;
 };
+struct ClosedDealRecord
+{
+   ulong    dealTicket;
+   ulong    positionId;
+   string   symbol;
+   int      direction;          // 1=BUY, -1=SELL
+   double   netProfit;
+   string   signalCombination;
+   double   confidence;
+   double   threat;
+   int      mtfScore;
+   datetime closeTime;
+   int      session;
+};
 struct CombinationStats
 {
    string   combination;
@@ -406,6 +420,16 @@ struct AIResponse
    datetime lastUpdate;
    int      consecutiveErrors;
 };
+//+------------------------------------------------------------------+
+//| Forward declarations (closed-deal dataset utilities)             |
+//+------------------------------------------------------------------+
+int GetSessionForTime(datetime timestamp);
+void AppendClosedDealRecord(ulong dealTicket, ulong positionId, const string &symbol,
+                            int direction, double netProfit, const string &combination,
+                            double confidence, double threat, int mtfScore,
+                            datetime closeTime, int session);
+int LoadClosedDealRecords(ClosedDealRecord &records[]);
+ulong GetLastClosedDealTicketFromDataset();
 //+------------------------------------------------------------------+
 //| SECTION 5: GLOBAL VARIABLES                                      |
 //+------------------------------------------------------------------+
@@ -641,6 +665,9 @@ int OnInit()
       LoadMarkovData();
    if(INPUT_ENABLE_ADAPTIVE)
       LoadAdaptiveParams();
+   
+   //--- Recover last processed closed deal ticket from common dataset
+   g_lastProcessedDealTicket = GetLastClosedDealTicketFromDataset();
    
    //--- Initialize daily stats
    g_startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -2534,10 +2561,11 @@ bool IsAllowedSession()
    return false;
 }
 //+------------------------------------------------------------------+
-int GetCurrentSession()
+int GetSessionForTime(datetime timestamp)
 {
+
    MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
+   TimeToStruct(timestamp, dt);
    int hour = dt.hour;
    
    // Priority: NY > London > Asian (for overlaps)
@@ -2546,6 +2574,11 @@ int GetCurrentSession()
    if(hour >= INPUT_ASIAN_START && hour < INPUT_ASIAN_END) return 0;
    
    return -1; // Off?hours
+}
+//+------------------------------------------------------------------+
+int GetCurrentSession()
+{
+   return GetSessionForTime(TimeCurrent());
 }
 //+------------------------------------------------------------------+
 //| SECTION 20: SL/TP CALCULATION (Threat?adjusted)                  |
@@ -3287,6 +3320,40 @@ void ProcessClosedPositions()
       double swap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
       double commission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
       double netProfit = profit + swap + commission;
+      ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      string symbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+      datetime closeTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+      int sessionAtClose = GetSessionForTime(closeTime);
+      int direction = 0;
+      ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+      if(dealType == DEAL_TYPE_BUY) direction = -1;
+      else if(dealType == DEAL_TYPE_SELL) direction = 1;
+      
+      string combination = "UNKNOWN";
+      double confidence = 0.0;
+      double threat = 0.0;
+      int mtfScore = 0;
+      
+      for(int p = 0; p < g_positionCount; p++)
+      {
+         if(g_positions[p].ticket == posId)
+         {
+            direction = g_positions[p].direction;
+            combination = g_positions[p].signalCombination;
+            confidence = g_positions[p].confidenceAtEntry;
+            threat = g_positions[p].threatAtEntry;
+            mtfScore = g_positions[p].mtfScoreAtEntry;
+            break;
+         }
+      }
+      
+      if(StringLen(combination) == 0)
+         combination = "UNKNOWN";
+      
+      // Always persist minimal closed-deal record (non-blocking for RL/ML)
+      AppendClosedDealRecord(dealTicket, posId, symbol, direction, netProfit,
+                             combination, confidence, threat, mtfScore,
+                             closeTime, sessionAtClose);
       
       bool isWin = (netProfit > 0);
       
@@ -3320,7 +3387,6 @@ void ProcessClosedPositions()
       // Q?learning update (if enabled)
       if(INPUT_ENABLE_RL)
       {
-         ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
          UpdateRLFromTrade(posId, netProfit);
       }
       
@@ -3637,6 +3703,109 @@ void CleanupInactivePositions()
 //+------------------------------------------------------------------+
 //| SECTION 30: DATA PERSISTENCE                                     |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+string GetClosedDealsDatasetFilename()
+{
+   return _Symbol + "_" + IntegerToString(INPUT_MAGIC_NUMBER) + "_closed_deals.csv";
+}
+//+------------------------------------------------------------------+
+void AppendClosedDealRecord(ulong dealTicket, ulong positionId, const string &symbol,
+                            int direction, double netProfit, const string &combination,
+                            double confidence, double threat, int mtfScore,
+                            datetime closeTime, int session)
+{
+   string filename = GetClosedDealsDatasetFilename();
+   bool fileExists = FileIsExist(filename, FILE_COMMON);
+   int flags = FILE_CSV | FILE_ANSI | FILE_COMMON;
+   int handle = fileExists ?
+                FileOpen(filename, FILE_READ | FILE_WRITE | flags, ',') :
+                FileOpen(filename, FILE_WRITE | flags, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      Print("WARNING: Failed to open closed-deal dataset file: ", filename,
+            " | err=", GetLastError());
+      return;
+   }
+   
+   if(!fileExists)
+      FileWrite(handle, "DealTicket", "PositionId", "Symbol", "Direction", "NetProfit",
+                "Combination", "Confidence", "Threat", "MTF", "CloseTime", "Session");
+   else
+      FileSeek(handle, 0, SEEK_END);
+   
+   FileWrite(handle,
+      dealTicket,
+      positionId,
+      symbol,
+      direction,
+      netProfit,
+      combination,
+      confidence,
+      threat,
+      mtfScore,
+      closeTime,
+      session);
+   
+   FileClose(handle);
+}
+//+------------------------------------------------------------------+
+int LoadClosedDealRecords(ClosedDealRecord &records[])
+{
+   string filename = GetClosedDealsDatasetFilename();
+   if(!FileIsExist(filename, FILE_COMMON))
+      return 0;
+   
+   int handle = FileOpen(filename, FILE_READ | FILE_CSV | FILE_ANSI | FILE_COMMON, ',');
+   if(handle == INVALID_HANDLE)
+      return 0;
+   
+   // Skip header (11 fields)
+   for(int h = 0; h < 11 && !FileIsEnding(handle); h++)
+      FileReadString(handle);
+   
+   int count = 0;
+   ArrayResize(records, 0);
+   while(!FileIsEnding(handle))
+   {
+      ClosedDealRecord rec;
+      rec.dealTicket = (ulong)FileReadNumber(handle);
+      rec.positionId = (ulong)FileReadNumber(handle);
+      rec.symbol = FileReadString(handle);
+      rec.direction = (int)FileReadNumber(handle);
+      rec.netProfit = FileReadNumber(handle);
+      rec.signalCombination = FileReadString(handle);
+      rec.confidence = FileReadNumber(handle);
+      rec.threat = FileReadNumber(handle);
+      rec.mtfScore = (int)FileReadNumber(handle);
+      rec.closeTime = (datetime)FileReadNumber(handle);
+      rec.session = (int)FileReadNumber(handle);
+      
+      if(rec.dealTicket == 0)
+         continue;
+      
+      ArrayResize(records, count + 1);
+      records[count] = rec;
+      count++;
+   }
+   
+   FileClose(handle);
+   return count;
+}
+//+------------------------------------------------------------------+
+ulong GetLastClosedDealTicketFromDataset()
+{
+   ClosedDealRecord records[];
+   int count = LoadClosedDealRecords(records);
+   if(count <= 0)
+      return 0;
+   
+   ulong lastTicket = 0;
+   for(int i = 0; i < count; i++)
+      if(records[i].dealTicket > lastTicket)
+         lastTicket = records[i].dealTicket;
+   
+   return lastTicket;
+}
 void SaveQTable()
 {
    string filename = _Symbol + "_" + IntegerToString(INPUT_MAGIC_NUMBER) + "_qtable.bin";
