@@ -399,6 +399,16 @@ struct DailyStats
    double   lossToday;
    double   peakEquityToday;
 };
+struct GateDiagnostics
+{
+   int      sessionRejects;
+   int      cooldownRejects;
+   int      signalsRejects;
+   int      mtfRejects;
+   int      threatRejects;
+   int      confidenceRejects;
+   int      maxPositionsRejects;
+};
 struct RLStateAction
 {
    int      state;
@@ -452,6 +462,7 @@ double   g_averageATR = 0;
 int      g_totalTrades = 0;
 //--- Daily tracking
 DailyStats g_daily;
+GateDiagnostics g_gateDiagnostics;
 //--- Market regime
 ENUM_MARKET_REGIME g_currentRegime = REGIME_UNKNOWN;
 //--- Indicator handles - M1
@@ -588,7 +599,7 @@ int OnInit()
    g_adaptive.maxPositions = INPUT_MAX_CONCURRENT_TRADES;
    g_adaptive.lastOptimization = 0;
    g_adaptive.tradesAtLastOpt = 0;
-   
+      ZeroMemory(g_gateDiagnostics);
    //--- Setup trade object
    g_trade.SetExpertMagicNumber(INPUT_MAGIC_NUMBER);
    g_trade.SetDeviationInPoints(30);
@@ -739,7 +750,13 @@ void OnDeinit(const int reason)
    
    //--- Remove chart objects
    ObjectsDeleteAll(0, "V7_");
-   
+      Print("Gate diagnostics summary | session=", g_gateDiagnostics.sessionRejects,
+         " cooldown=", g_gateDiagnostics.cooldownRejects,
+         " signals=", g_gateDiagnostics.signalsRejects,
+         " mtf=", g_gateDiagnostics.mtfRejects,
+         " threat=", g_gateDiagnostics.threatRejects,
+         " confidence=", g_gateDiagnostics.confidenceRejects,
+         " max_positions=", g_gateDiagnostics.maxPositionsRejects);
    Print("=== EA V7.2 HumanBrain DEINITIALIZED (reason=", reason, ") ===");
 }
 //+------------------------------------------------------------------+
@@ -2182,8 +2199,7 @@ void DetectMarketRegime()
       return;
    }
    
-   // ADX?based trend/range detection
-   if(adx[0] >= 25)
+      if(adx[0] >= 25)
       g_currentRegime = REGIME_TRENDING;
    else if(adx[0] < 20)
       g_currentRegime = REGIME_RANGING;
@@ -2208,6 +2224,7 @@ bool RunDecisionPipeline(DecisionResult &decision)
    SignalResult signals;
    if(!DetectSignals(signals))
    {
+      g_gateDiagnostics.signalsRejects++;
       if(INPUT_ENABLE_LOGGING)
          Print("Signal detection failed");
       return false;
@@ -2215,6 +2232,7 @@ bool RunDecisionPipeline(DecisionResult &decision)
    
    if(signals.totalSignals < INPUT_MIN_SIGNALS)
    {
+      g_gateDiagnostics.signalsRejects++;
       if(INPUT_ENABLE_LOGGING)
          Print("Not enough signals: ", signals.totalSignals, " < ", INPUT_MIN_SIGNALS);
       return false;
@@ -2236,6 +2254,7 @@ bool RunDecisionPipeline(DecisionResult &decision)
    }
    else
    {
+      g_gateDiagnostics.signalsRejects++;
       if(INPUT_ENABLE_LOGGING)
          Print("Signal tie: bull=", signals.bullVotes, " bear=", signals.bearVotes);
       return false; // Tie ? no trade
@@ -2278,6 +2297,7 @@ bool RunDecisionPipeline(DecisionResult &decision)
     int mtfScore = CalculateMTFAlignment(direction);
     if(INPUT_MIN_MTF_SCORE > 0 && mtfScore < INPUT_MIN_MTF_SCORE)
     {
+       g_gateDiagnostics.mtfRejects++;
        if(INPUT_ENABLE_LOGGING)
           Print("MTF alignment failed: ", mtfScore, " < ", INPUT_MIN_MTF_SCORE);
        return false;
@@ -2295,6 +2315,7 @@ bool RunDecisionPipeline(DecisionResult &decision)
    
    if(threat > INPUT_MAX_THREAT_ENTRY)
    {
+      g_gateDiagnostics.threatRejects++;
       if(INPUT_ENABLE_LOGGING)
          Print("Threat too high: ", threat, " > ", INPUT_MAX_THREAT_ENTRY);
       return false;
@@ -2308,6 +2329,7 @@ bool RunDecisionPipeline(DecisionResult &decision)
    double minConf = g_adaptive.minConfThreshold;
    if(confidence < minConf)
    {
+      g_gateDiagnostics.confidenceRejects++;
       if(INPUT_ENABLE_LOGGING)
          Print("Confidence too low: ", confidence, " < ", minConf);
       return false;
@@ -2334,6 +2356,7 @@ bool RunDecisionPipeline(DecisionResult &decision)
    //--- STEP 10: Decision matrix â€“ we now only block on extreme threat
    if(threatZone == THREAT_EXTREME)
    {
+      g_gateDiagnostics.threatRejects++;
       if(INPUT_ENABLE_LOGGING)
          Print("Extreme threat zone â€“ blocking trade");
       return false;
@@ -2357,6 +2380,7 @@ bool RunDecisionPipeline(DecisionResult &decision)
       return false;
    }
    
+
    //--- Fill decision structure
    decision.shouldTrade = true;
    decision.direction = direction;
@@ -2413,14 +2437,16 @@ bool CheckAllGates(string &rejectReason)
       return false;
    }
    
-   if(!IsAllowedSession())
+      if(!IsAllowedSession())
    {
+      g_gateDiagnostics.sessionRejects++;
       rejectReason = "Outside trading session";
       return false;
    }
    
    if(TimeCurrent() - g_lastOrderTime < INPUT_ORDER_COOLDOWN_SECONDS)
    {
+      g_gateDiagnostics.cooldownRejects++;
       rejectReason = "Order cooldown active";
       return false;
    }
@@ -2460,6 +2486,7 @@ bool CheckAllGates(string &rejectReason)
    int currentTotalPositions = CountAllOurPositions();
    if(currentMainPositions >= g_adaptive.maxPositions)
    {
+      g_gateDiagnostics.maxPositionsRejects++;
       rejectReason = "Max positions reached (main=" + IntegerToString(currentMainPositions) +
                      " total=" + IntegerToString(currentTotalPositions) +
                      " max=" + IntegerToString(g_adaptive.maxPositions) + ")";
@@ -4196,7 +4223,7 @@ void DrawStatsPanel()
    ObjectSetInteger(0, prefix + "bg", OBJPROP_XDISTANCE, x);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_YDISTANCE, y);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_XSIZE, 280);
-   ObjectSetInteger(0, prefix + "bg", OBJPROP_YSIZE, 340);
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_YSIZE, 430);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_BGCOLOR, bgColor);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_BORDER_TYPE, BORDER_FLAT);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_CORNER, CORNER_LEFT_UPPER);
@@ -4272,10 +4299,26 @@ void DrawStatsPanel()
                x + 10, y, txtColor, 9);
    y += 18;
    
-   // Total trades
+      // Total trades
    CreateLabel(prefix + "total", "Total Trades: " + IntegerToString(g_totalTrades), x + 10, y, txtColor, 9);
    y += 18;
-   
+
+   // Gate diagnostics
+   CreateLabel(prefix + "diagSession", "Rejects Session/Cooldown: " +
+               IntegerToString(g_gateDiagnostics.sessionRejects) + " / " +
+               IntegerToString(g_gateDiagnostics.cooldownRejects), x + 10, y, txtColor, 9);
+   y += 18;
+   CreateLabel(prefix + "diagSignals", "Rejects Signals/MTF: " +
+               IntegerToString(g_gateDiagnostics.signalsRejects) + " / " +
+               IntegerToString(g_gateDiagnostics.mtfRejects), x + 10, y, txtColor, 9);
+   y += 18;
+   CreateLabel(prefix + "diagThreat", "Rejects Threat/Confidence: " +
+               IntegerToString(g_gateDiagnostics.threatRejects) + " / " +
+               IntegerToString(g_gateDiagnostics.confidenceRejects), x + 10, y, txtColor, 9);
+   y += 18;
+   CreateLabel(prefix + "diagMaxPos", "Rejects Max Positions: " +
+               IntegerToString(g_gateDiagnostics.maxPositionsRejects), x + 10, y, txtColor, 9);
+   y += 18;
    // RL info
    if(INPUT_ENABLE_RL)
    {
