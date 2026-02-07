@@ -393,6 +393,7 @@ struct DailyStats
 {
    datetime dayStart;
    int      tradesPlaced;
+   int      closedDealsToday;
    int      winsToday;
    int      lossesToday;
    double   profitToday;
@@ -750,6 +751,23 @@ void OnDeinit(const int reason)
    
    //--- Remove chart objects
    ObjectsDeleteAll(0, "V7_");
+
+   if((bool)MQLInfoInteger(MQL_TESTER))
+   {
+      int openPositions = CountAllOurPositions();
+      if(openPositions > 0)
+      {
+         double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+         double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+         double openPL = GetOpenProfitLoss();
+         Print("TEST END NOTICE: ", openPositions,
+               " position(s) still open. Balance may appear unchanged until forced close. ",
+               "Balance=", DoubleToString(balance, 2),
+               " Equity=", DoubleToString(equity, 2),
+               " OpenP/L=", DoubleToString(openPL, 2));
+      }
+   }
+
       Print("Gate diagnostics summary | session=", g_gateDiagnostics.sessionRejects,
          " cooldown=", g_gateDiagnostics.cooldownRejects,
          " signals=", g_gateDiagnostics.signalsRejects,
@@ -1028,6 +1046,20 @@ int CountAllOurPositions()
       count++;
    }
    return count;
+}
+//--- Sum floating P/L for all positions belonging to this EA
+double GetOpenProfitLoss()
+{
+   double openProfitLoss = 0.0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!IsOurPosition(ticket)) continue;
+      openProfitLoss += PositionGetDouble(POSITION_PROFIT);
+   }
+   return openProfitLoss;
 }
 //--- Count recovery/averaging positions (used for state machine)
 int CountRecoveryPositions()
@@ -3425,6 +3457,7 @@ void ProcessClosedPositions()
       double netProfit = profit + swap + commission;
       
       bool isWin = (netProfit > 0);
+      g_daily.closedDealsToday++;
 
       // Always persist minimal closed-trade record (independent from ML/RL/Markov)
       RecordClosedDealData(dealTicket, netProfit);
@@ -3789,6 +3822,7 @@ void ResetDailyCounters()
 {
    g_daily.dayStart = iTime(_Symbol, PERIOD_D1, 0);
    g_daily.tradesPlaced = 0;
+   g_daily.closedDealsToday = 0;
    g_daily.winsToday = 0;
    g_daily.lossesToday = 0;
    g_daily.profitToday = 0;
@@ -4222,7 +4256,7 @@ void DrawStatsPanel()
    ObjectCreate(0, prefix + "bg", OBJ_RECTANGLE_LABEL, 0, 0, 0);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_XDISTANCE, x);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, prefix + "bg", OBJPROP_XSIZE, 280);
+   ObjectSetInteger(0, prefix + "bg", OBJPROP_XSIZE, 360);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_YSIZE, 430);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_BGCOLOR, bgColor);
    ObjectSetInteger(0, prefix + "bg", OBJPROP_BORDER_TYPE, BORDER_FLAT);
@@ -4264,6 +4298,16 @@ void DrawStatsPanel()
    // Position counts (broker counts)
    int mainPos = CountMainPositionsFromBroker();
    int totalPos = CountAllOurPositions();
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double openPL = GetOpenProfitLoss();
+   color openPLColor = openPL >= 0 ? clrLime : clrRed;
+   CreateLabel(prefix + "account", "Bal: " + DoubleToString(balance, 2) +
+               " | Eq: " + DoubleToString(equity, 2) +
+               " | Open P/L: " + DoubleToString(openPL, 2),
+               x + 10, y, openPLColor, 9);
+   y += 18;
+
    CreateLabel(prefix + "positions", "Positions: " + IntegerToString(mainPos) + " main / " +
                IntegerToString(totalPos) + " total (max " + IntegerToString(g_adaptive.maxPositions) + ")",
                x + 10, y, txtColor, 9);
@@ -4272,6 +4316,11 @@ void DrawStatsPanel()
    // Daily stats
    CreateLabel(prefix + "daily", "Today: " + IntegerToString(g_daily.tradesPlaced) + " trades | W:" +
                IntegerToString(g_daily.winsToday) + " L:" + IntegerToString(g_daily.lossesToday),
+               x + 10, y, txtColor, 9);
+   y += 18;
+
+   CreateLabel(prefix + "activity", "Open Positions: " + IntegerToString(totalPos) +
+               " | Closed Deals Today: " + IntegerToString(g_daily.closedDealsToday),
                x + 10, y, txtColor, 9);
    y += 18;
    
