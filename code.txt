@@ -2375,51 +2375,79 @@ bool CheckAllGates(string &rejectReason)
       g_adaptive.maxPositions = INPUT_MAX_CONCURRENT_TRADES;
       Print("WARNING: maxPositions was 0 or negative! Reset to ", INPUT_MAX_CONCURRENT_TRADES);
    }
-   
+
+   bool isTester = (MQLInfoInteger(MQL_TESTER) != 0);
+   string gateContext = isTester ? "TESTER" : "LIVE";
+
+   // Keep live connectivity gate strict, but relax it in tester mode.
    if(!TerminalInfoInteger(TERMINAL_CONNECTED))
    {
-      rejectReason = "Terminal disconnected";
-      return false;
+      if(isTester)
+      {
+         if(INPUT_ENABLE_LOGGING)
+            Print("GATE INFO [", gateContext, "]: Terminal disconnected (connectivity gate relaxed in tester)");
+      }
+      else
+      {
+         rejectReason = "Terminal disconnected";
+         if(INPUT_ENABLE_LOGGING)
+            Print("GATE REJECT [", gateContext, "]: ", rejectReason);
+         return false;
+      }
    }
-   
+
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
    {
       rejectReason = "AutoTrading disabled";
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE REJECT [", gateContext, "]: ", rejectReason);
       return false;
    }
-   
+
    if(!IsAllowedSession())
    {
       rejectReason = "Outside trading session";
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE REJECT [", gateContext, "]: ", rejectReason);
       return false;
    }
-   
+
    if(TimeCurrent() - g_lastOrderTime < INPUT_ORDER_COOLDOWN_SECONDS)
    {
       rejectReason = "Order cooldown active";
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE REJECT [", gateContext, "]: ", rejectReason);
       return false;
    }
-   
+
    if(g_daily.tradesPlaced >= INPUT_MAX_DAILY_TRADES)
    {
       rejectReason = "Daily trade limit reached";
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE REJECT [", gateContext, "]: ", rejectReason);
       return false;
    }
-   
+
    double dayLoss = g_daily.lossToday;
    double maxDayLoss = g_startingBalance * (INPUT_DAILY_LOSS_LIMIT_PERCENT / 100.0);
    if(dayLoss >= maxDayLoss)
    {
       rejectReason = "Daily loss limit reached";
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE REJECT [", gateContext, "]: ", rejectReason,
+               " | dayLoss=", DoubleToString(dayLoss, 2),
+               " maxLoss=", DoubleToString(maxDayLoss, 2));
       return false;
    }
-   
+
    if(g_consecutiveLosses >= INPUT_MAX_CONSECUTIVE_LOSSES)
    {
       rejectReason = "Consecutive loss limit reached";
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE REJECT [", gateContext, "]: ", rejectReason);
       return false;
    }
-   
+
    // Spread check â€“ more tolerant now
    double spreadPoints = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    double spread = spreadPoints * g_point;
@@ -2427,9 +2455,13 @@ bool CheckAllGates(string &rejectReason)
    if(avgSpread > 0 && spread > avgSpread * 5.0) // FIXED: changed from 3.0 to 5.0
    {
       rejectReason = "Spread too high";
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE REJECT [", gateContext, "]: ", rejectReason,
+               " | spread=", DoubleToString(spread, 5),
+               " avg=", DoubleToString(avgSpread, 5));
       return false;
    }
-   
+
    // Position limit check (main positions only)
    int currentMainPositions = CountMainPositionsFromBroker();
    int currentTotalPositions = CountAllOurPositions();
@@ -2438,16 +2470,20 @@ bool CheckAllGates(string &rejectReason)
       rejectReason = "Max positions reached (main=" + IntegerToString(currentMainPositions) +
                      " total=" + IntegerToString(currentTotalPositions) +
                      " max=" + IntegerToString(g_adaptive.maxPositions) + ")";
+      if(INPUT_ENABLE_LOGGING)
+         Print("GATE REJECT [", gateContext, "]: ", rejectReason);
       return false;
    }
-   
+
     // EA state check
     if(g_eaState == STATE_EXTREME_RISK || g_eaState == STATE_DRAWDOWN_PROTECT)
     {
        rejectReason = "EA in protection mode";
+       if(INPUT_ENABLE_LOGGING)
+          Print("GATE REJECT [", gateContext, "]: ", rejectReason);
        return false;
     }
-    
+
     return true;
  }
  //+------------------------------------------------------------------+
