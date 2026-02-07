@@ -31,6 +31,11 @@ enum ENUM_AI_MODE
    AI_OVERLAY       = 1,    // AI Overlay (confidence boost)
    AI_FULL          = 2     // AI Full Control
 };
+enum ENUM_EXECUTION_MODE
+{
+   MARKET       = 0,   // Immediate market order
+   PENDING_STOP = 1    // Place stop pending order
+};
 enum ENUM_MARKET_REGIME
 {
    REGIME_UNKNOWN    = 0,   // Unknown
@@ -82,10 +87,13 @@ input int      INPUT_EXPIRY_DAY   = 31;           // Expiry Day
 input group    "=== Trading Configuration ==="
 input int      INPUT_MAX_CONCURRENT_TRADES  = 3;  // Max concurrent MAIN trades (FIXED: Reduced from 5)
 input int      INPUT_MAX_SAME_DIRECTION    = 2;  // Max same-direction trades
-input double   INPUT_PROXIMITY_POINTS      = 500.0; // Min distance between entries (points)
+input double   INPUT_PROXIMITY_POINTS      = 0.0; // Proximity rule disabled (timeout-only pacing)
 input int      INPUT_POSITION_AGE_HOURS    = 24;  // Close stale positions after N hours (0=disabled)
 input int      INPUT_MAGIC_NUMBER           = 770700; // Magic Number
 input int      INPUT_ORDER_COOLDOWN_SECONDS = 300; // Cooldown between orders (seconds) FIXED: 5 minutes to prevent clustering
+input ENUM_EXECUTION_MODE INPUT_EXECUTION_MODE = MARKET; // Order execution mode
+input int      INPUT_PENDING_STOP_OFFSET_POINTS = 30; // Stop trigger offset from market (points)
+input int      INPUT_PENDING_EXPIRY_MINUTES = 60; // Pending stop expiry in minutes
 //--- Risk Management
 input group    "=== Risk Management ==="
 input ENUM_RISK_PROFILE INPUT_RISK_PROFILE = RISK_MEDIUM; // Risk Profile
@@ -1877,14 +1885,18 @@ void RecordStateAction(int state, ENUM_RL_ACTION action, ulong positionTicket)
    g_pendingRL[g_pendingRLCount].timestamp = TimeCurrent();
    g_pendingRL[g_pendingRLCount].positionTicket = positionTicket;
    g_pendingRLCount++;
+      
+   if(INPUT_ENABLE_LOGGING)
+      Print("RL Pending: State=", state, " Action=", EnumToString(action),
+            " | PositionTicket=", positionTicket);
 }
 //+------------------------------------------------------------------+
-void UpdateRLFromTrade(ulong ticket, double reward)
+void UpdateRLFromTrade(ulong positionTicket, double reward)
 {
    // Find pending RL record for this trade
    for(int i = 0; i < g_pendingRLCount; i++)
    {
-      if(g_pendingRL[i].positionTicket == ticket)
+        if(g_pendingRL[i].positionTicket == positionTicket)
       {
          int state = g_pendingRL[i].state;
          ENUM_RL_ACTION action = g_pendingRL[i].action;
@@ -1916,7 +1928,8 @@ void UpdateRLFromTrade(ulong ticket, double reward)
          
          if(INPUT_ENABLE_LOGGING)
             Print("RL Update: State=", state, " Action=", EnumToString(action),
-                  " Reward=", reward, " OldQ=", oldQ, " NewQ=", newQ);
+                                   " Reward=", reward, " OldQ=", oldQ, " NewQ=", newQ,
+                  " | PositionTicket=", positionTicket);
          
          break;
       }
@@ -2376,7 +2389,8 @@ bool CheckAllGates(string &rejectReason)
       Print("WARNING: maxPositions was 0 or negative! Reset to ", INPUT_MAX_CONCURRENT_TRADES);
    }
    
-   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+     bool isTesterMode = (MQLInfoInteger(MQL_TESTER) != 0);
+   if(!isTesterMode && !TerminalInfoInteger(TERMINAL_CONNECTED))
    {
       rejectReason = "Terminal disconnected";
       return false;
@@ -2676,6 +2690,59 @@ double CalculateLotSize(double slPoints, double confidence, double threat, ENUM_
 //+------------------------------------------------------------------+
 //| SECTION 22: ORDER EXECUTION                                      |
 //+------------------------------------------------------------------+
+bool PlacePendingStopOrder(const DecisionResult &decision, string comment)
+{
+   MqlTradeRequest request;
+   MqlTradeResult result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double offset = INPUT_PENDING_STOP_OFFSET_POINTS * g_point;
+
+   request.action = TRADE_ACTION_PENDING;
+   request.symbol = _Symbol;
+   request.magic = INPUT_MAGIC_NUMBER;
+   request.volume = decision.lotSize;
+   request.deviation = 30;
+   request.comment = comment;
+   request.type_time = ORDER_TIME_SPECIFIED;
+   request.expiration = TimeCurrent() + (INPUT_PENDING_EXPIRY_MINUTES * 60);
+
+   if(decision.direction == 1)
+   {
+      request.type = ORDER_TYPE_BUY_STOP;
+      request.price = NormalizeDouble(ask + offset, g_digits);
+      request.sl = NormalizeDouble(request.price - decision.slPoints * g_point, g_digits);
+      request.tp = NormalizeDouble(request.price + decision.tpPoints * g_point, g_digits);
+   }
+   else
+   {
+      request.type = ORDER_TYPE_SELL_STOP;
+      request.price = NormalizeDouble(bid - offset, g_digits);
+      request.sl = NormalizeDouble(request.price + decision.slPoints * g_point, g_digits);
+      request.tp = NormalizeDouble(request.price - decision.tpPoints * g_point, g_digits);
+   }
+
+   Print("PENDING STOP REQUEST: Type=", EnumToString(request.type),
+         " | Trigger=", DoubleToString(request.price, g_digits),
+         " | SL=", DoubleToString(request.sl, g_digits),
+         " | TP=", DoubleToString(request.tp, g_digits),
+         " | Expiry=", TimeToString(request.expiration, TIME_DATE|TIME_SECONDS),
+         " | Lot=", DoubleToString(request.volume, 2));
+
+   bool sent = OrderSend(request, result);
+   Print("PENDING STOP RESULT: Retcode=", result.retcode,
+         " | Deal=", result.deal,
+         " | Order=", result.order,
+         " | Comment=", result.comment);
+
+   if(!sent || (result.retcode != TRADE_RETCODE_DONE && result.retcode != TRADE_RETCODE_PLACED))
+      return false;
+
+   return true;
+}
 bool ExecuteOrder(const DecisionResult &decision)
 {
    double price, sl, tp;
@@ -2701,8 +2768,38 @@ bool ExecuteOrder(const DecisionResult &decision)
    price = NormalizeDouble(price, g_digits);
    
    string comment = COMMENT_MAIN_PREFIX + IntegerToString(TimeCurrent());
-   
+    if(INPUT_EXECUTION_MODE == PENDING_STOP)
+   {
+      if(!PlacePendingStopOrder(decision, comment))
+      {
+         Print("PENDING STOP ORDER FAILED");
+         return false;
+      }
+
+      Print("PENDING STOP ORDER PLACED: ", (decision.direction == 1 ? "BUY_STOP" : "SELL_STOP"),
+            " | Lot: ", decision.lotSize,
+            " | BasePrice: ", price,
+            " | Conf: ", DoubleToString(decision.confidence, 1), "%",
+            " | Threat: ", DoubleToString(decision.threatLevel, 1),
+            " | Zone: ", EnumToString(decision.threatZone),
+            " | Signals: ", decision.signalCombination);
+
+      g_lastOrderTime = TimeCurrent();
+      g_daily.tradesPlaced++;
+      g_totalTrades++;
+      return true;
+   }
+
    // 3 retry attempts
+            ulong orderTicket = g_trade.ResultOrder();
+         ulong positionTicket = 0;
+         
+         if(PositionSelect(_Symbol) && PositionGetInteger(POSITION_MAGIC) == INPUT_MAGIC_NUMBER)
+            positionTicket = (ulong)PositionGetInteger(POSITION_TICKET);
+         
+         if(positionTicket == 0)
+            positionTicket = orderTicket;
+            
    for(int attempt = 0; attempt < 3; attempt++)
    {
       g_trade.SetTypeFilling(GetFillingMode());
@@ -2716,11 +2813,12 @@ bool ExecuteOrder(const DecisionResult &decision)
                " | Conf: ", DoubleToString(decision.confidence, 1), "%",
                " | Threat: ", DoubleToString(decision.threatLevel, 1),
                " | Zone: ", EnumToString(decision.threatZone),
-               " | Signals: ", decision.signalCombination);
+                             " | Signals: ", decision.signalCombination,
+               " | OrderTicket: ", orderTicket,
+               " | PositionTicket: ", positionTicket);
          
          // Track position in internal array
-         ulong ticket = g_trade.ResultOrder();
-         TrackNewPosition(ticket, decision, comment);
+   TrackNewPosition(positionTicket, decision, comment);
          
          // Record RL state?action (if RL active)
          if(INPUT_ENABLE_RL)
@@ -2730,7 +2828,7 @@ bool ExecuteOrder(const DecisionResult &decision)
                                           CountMainPositionsFromBroker(),
                                           CalculateDrawdownPercent(),
                                           g_consecutiveWins >= 2);
-            RecordStateAction(state, decision.rlAction, ticket);
+                      RecordStateAction(state, decision.rlAction, positionTicket);
          }
          
          g_lastOrderTime = TimeCurrent();
@@ -2758,7 +2856,7 @@ bool ExecuteOrder(const DecisionResult &decision)
 //+------------------------------------------------------------------+
 
 //+------------------------------------------------------------------+
-void TrackNewPosition(ulong ticket, const DecisionResult &decision, string comment)
+void TrackNewPosition(ulong positionTicket, const DecisionResult &decision, string comment)
 {
    // Clean up inactive entries first
    CleanupInactivePositions();
@@ -2776,7 +2874,7 @@ void TrackNewPosition(ulong ticket, const DecisionResult &decision, string comme
                   SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
                   SymbolInfoDouble(_Symbol, SYMBOL_BID);
    
-   g_positions[idx].ticket = ticket;
+     g_positions[idx].ticket = positionTicket;
    g_positions[idx].direction = decision.direction;
    g_positions[idx].entryPrice = price;
    g_positions[idx].slPrice = (decision.direction == 1) ?
@@ -3289,6 +3387,9 @@ void ProcessClosedPositions()
       double netProfit = profit + swap + commission;
       
       bool isWin = (netProfit > 0);
+
+      // Always persist minimal closed-trade record (independent from ML/RL/Markov)
+      RecordClosedDealData(dealTicket, netProfit);
       
       // Update consecutive streak counters
       if(isWin)
@@ -3316,27 +3417,103 @@ void ProcessClosedPositions()
          
          UpdateMarkovTransition(g_lastMarkovState, newState);
       }
-      
+            ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
       // Q?learning update (if enabled)
       if(INPUT_ENABLE_RL)
-      {
-         ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+     
          UpdateRLFromTrade(posId, netProfit);
-      }
+    
       
       // Record training data (if enabled)
       if(INPUT_ENABLE_ML)
-         RecordTrainingData(dealTicket, netProfit, isWin);
+           RecordTrainingData(posId, dealTicket, netProfit, isWin);
       
       g_lastProcessedDealTicket = dealTicket;
       
-      Print("CLOSED DEAL: Ticket ", dealTicket, " | P&L: ", netProfit,
+      Print("CLOSED DEAL: DealTicket ", dealTicket,
+            " | PositionTicket: ", posId,
+            " | P&L: ", netProfit,
             " | Win: ", isWin, " | ConsWin: ", g_consecutiveWins,
             " | ConsLoss: ", g_consecutiveLosses);
    }
 }
 //+------------------------------------------------------------------+
-void RecordTrainingData(ulong dealTicket, double netProfit, bool isWin)
+int GetSessionFromTime(datetime ts)
+{
+   MqlDateTime dt;
+   TimeToStruct(ts, dt);
+   int hour = dt.hour;
+
+   // Priority: NY > London > Asian (for overlaps)
+   if(hour >= INPUT_NY_START && hour < INPUT_NY_END) return 2;
+   if(hour >= INPUT_LONDON_START && hour < INPUT_LONDON_END) return 1;
+   if(hour >= INPUT_ASIAN_START && hour < INPUT_ASIAN_END) return 0;
+
+   return -1;
+}
+//+------------------------------------------------------------------+
+void RecordClosedDealData(ulong dealTicket, double netProfit)
+{
+   string filename = _Symbol + "_" + IntegerToString(INPUT_MAGIC_NUMBER) + "_closed_deals.csv";
+   bool newFile = !FileIsExist(filename);
+   int handle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE) return;
+
+   if(newFile)
+   {
+      FileWrite(handle, "DealTicket", "PositionID", "Magic", "Symbol", "CloseTime", "Direction",
+                "NetProfit", "SignalCombination", "Confidence", "Threat", "MTFScore", "Session", "Regime");
+   }
+
+   FileSeek(handle, 0, SEEK_END);
+
+   ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+   datetime closeTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+   ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+
+   // For close deals, DEAL_TYPE is usually opposite side of original entry.
+   int direction = (dealType == DEAL_TYPE_SELL) ? 1 : -1;
+   string signalCombination = "";
+   double confidence = 0;
+   double threat = 0;
+   int mtfScore = 0;
+   datetime sessionRefTime = closeTime;
+
+   for(int i = 0; i < g_positionCount; i++)
+   {
+      if(g_positions[i].ticket == posId)
+      {
+         direction = g_positions[i].direction;
+         signalCombination = g_positions[i].signalCombination;
+         confidence = g_positions[i].confidenceAtEntry;
+         threat = g_positions[i].threatAtEntry;
+         mtfScore = g_positions[i].mtfScoreAtEntry;
+         sessionRefTime = g_positions[i].entryTime;
+         break;
+      }
+   }
+
+   int session = GetSessionFromTime(sessionRefTime);
+
+   FileWrite(handle,
+      dealTicket,
+      posId,
+      INPUT_MAGIC_NUMBER,
+      _Symbol,
+      closeTime,
+      direction,
+      netProfit,
+      signalCombination,
+      confidence,
+      threat,
+      mtfScore,
+      session,
+      (int)g_currentRegime);
+
+   FileClose(handle);
+}
+//+------------------------------------------------------------------+
+void RecordTrainingData(ulong positionTicket, ulong dealTicket, double netProfit, bool isWin)
 {
    // Shift array if full
    if(g_trainingDataCount >= INPUT_MAX_TRAINING_DATA)
@@ -3349,7 +3526,7 @@ void RecordTrainingData(ulong dealTicket, double netProfit, bool isWin)
    int idx = g_trainingDataCount;
    g_trainingDataCount++;
    
-   g_trainingData[idx].ticket = dealTicket;
+     g_trainingData[idx].ticket = positionTicket;
    g_trainingData[idx].closeTime = TimeCurrent();
    g_trainingData[idx].profitLoss = netProfit;
    g_trainingData[idx].isWin = isWin;
@@ -3362,10 +3539,10 @@ void RecordTrainingData(ulong dealTicket, double netProfit, bool isWin)
    g_trainingData[idx].volatilityRatio = CalculateVolatilityRatio();
    
    // Find matching position (if still alive) for extra info
-   ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+   
    for(int i = 0; i < g_positionCount; i++)
    {
-      if(g_positions[i].ticket == posId)
+           if(g_positions[i].ticket == positionTicket)
       {
          g_trainingData[idx].signalCombination = g_positions[i].signalCombination;
          g_trainingData[idx].confidenceAtEntry = g_positions[i].confidenceAtEntry;
@@ -3383,6 +3560,10 @@ void RecordTrainingData(ulong dealTicket, double netProfit, bool isWin)
    // Periodic recompute of combination stats
    if(g_trainingDataCount % 10 == 0)
       RecalculateCombinationStats();
+         if(INPUT_ENABLE_LOGGING)
+      Print("TRAINING DATA: DealTicket=", dealTicket,
+            " | PositionTicket=", positionTicket,
+            " | NetPnl=", netProfit);
 }
 //+------------------------------------------------------------------+
 //| SECTION 27: ADAPTIVE OPTIMIZATION (Part 14)                      |
