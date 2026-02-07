@@ -1922,7 +1922,7 @@ ENUM_RL_ACTION GetRLAction(int state)
    }
 }
 //+------------------------------------------------------------------+
-void RecordStateAction(int state, ENUM_RL_ACTION action, ulong positionTicket)
+void RecordStateAction(int state, ENUM_RL_ACTION action, ulong positionId)
 {
    if(g_pendingRLCount >= ArraySize(g_pendingRL))
    {
@@ -1932,20 +1932,20 @@ void RecordStateAction(int state, ENUM_RL_ACTION action, ulong positionTicket)
    g_pendingRL[g_pendingRLCount].state = state;
    g_pendingRL[g_pendingRLCount].action = action;
    g_pendingRL[g_pendingRLCount].timestamp = TimeCurrent();
-   g_pendingRL[g_pendingRLCount].positionTicket = positionTicket;
+   g_pendingRL[g_pendingRLCount].positionTicket = positionId;
    g_pendingRLCount++;
       
    if(INPUT_ENABLE_LOGGING)
       Print("RL Pending: State=", state, " Action=", EnumToString(action),
-            " | PositionTicket=", positionTicket);
+                     " | PositionId=", positionId);
 }
-//+------------------------------------------------------------------+
-void UpdateRLFromTrade(ulong positionTicket, double reward)
+//+------------------------------------------------------------------+␊
+void UpdateRLFromTrade(ulong positionId, double reward)
 {
    // Find pending RL record for this trade
    for(int i = 0; i < g_pendingRLCount; i++)
    {
-        if(g_pendingRL[i].positionTicket == positionTicket)
+         if(g_pendingRL[i].positionTicket == positionId)
       {
          int state = g_pendingRL[i].state;
          ENUM_RL_ACTION action = g_pendingRL[i].action;
@@ -1978,7 +1978,7 @@ void UpdateRLFromTrade(ulong positionTicket, double reward)
          if(INPUT_ENABLE_LOGGING)
             Print("RL Update: State=", state, " Action=", EnumToString(action),
                                    " Reward=", reward, " OldQ=", oldQ, " NewQ=", newQ,
-                  " | PositionTicket=", positionTicket);
+                                   " | PositionId=", positionId);
          
          break;
       }
@@ -2810,8 +2810,44 @@ bool PlacePendingStopOrder(const DecisionResult &decision, string comment)
 
    if(!sent || (result.retcode != TRADE_RETCODE_DONE && result.retcode != TRADE_RETCODE_PLACED))
       return false;
+ return true;
+}
+ulong ResolveOpenedPositionId(ulong orderTicket, string comment)
+{
+   // 1) Prefer live-position lookup by our comment/magic/symbol
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!IsOurPosition(ticket)) continue;
+      if(PositionGetString(POSITION_COMMENT) != comment) continue;
 
-   return true;
+      return ticket;
+   }
+
+   // 2) Fallback to deal history mapping (order -> position)
+   if(orderTicket != 0)
+   {
+      if(HistorySelect(TimeCurrent() - 300, TimeCurrent() + 5))
+      {
+         int deals = HistoryDealsTotal();
+         for(int i = deals - 1; i >= 0; i--)
+         {
+            ulong dealTicket = HistoryDealGetTicket(i);
+            if(dealTicket == 0) continue;
+            if((ulong)HistoryDealGetInteger(dealTicket, DEAL_ORDER) != orderTicket) continue;
+            if((ulong)HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != INPUT_MAGIC_NUMBER) continue;
+            if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol) continue;
+
+            ulong positionId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+            if(positionId != 0)
+               return positionId;
+         }
+      }
+   }
+
+   return 0;
 }
 bool ExecuteOrder(const DecisionResult &decision)
 {
@@ -2861,21 +2897,20 @@ bool ExecuteOrder(const DecisionResult &decision)
    }
 
    // 3 retry attempts
-            ulong orderTicket = g_trade.ResultOrder();
-         ulong positionTicket = 0;
-         
-         if(PositionSelect(_Symbol) && PositionGetInteger(POSITION_MAGIC) == INPUT_MAGIC_NUMBER)
-            positionTicket = (ulong)PositionGetInteger(POSITION_TICKET);
-         
-         if(positionTicket == 0)
-            positionTicket = orderTicket;
-            
    for(int attempt = 0; attempt < 3; attempt++)
    {
       g_trade.SetTypeFilling(GetFillingMode());
       
       if(g_trade.PositionOpen(_Symbol, orderType, decision.lotSize, price, sl, tp, comment))
       {
+         ulong orderTicket = g_trade.ResultOrder();
+         ulong positionId = ResolveOpenedPositionId(orderTicket, comment);
+         if(positionId == 0)
+            positionId = orderTicket;
+
+         Print("OPEN VALIDATION: orderTicket=", orderTicket,
+               " -> positionId=", positionId);
+
          Print("ORDER PLACED: ", (decision.direction == 1 ? "BUY" : "SELL"),
                " | Lot: ", decision.lotSize,
                " | Price: ", price,
@@ -2885,20 +2920,19 @@ bool ExecuteOrder(const DecisionResult &decision)
                " | Zone: ", EnumToString(decision.threatZone),
                              " | Signals: ", decision.signalCombination,
                " | OrderTicket: ", orderTicket,
-               " | PositionTicket: ", positionTicket);
+               " | PositionId: ", positionId);
          
          // Track position in internal array
-   TrackNewPosition(positionTicket, decision, comment);
-         
+   TrackNewPosition(positionId, decision, comment);
          // Record RL state?action (if RL active)
          if(INPUT_ENABLE_RL)
          {
-            int state = DetermineRLState(decision.confidence,
+          int state = DetermineRLState(decision.confidence,
                                           decision.threatLevel,
                                           CountMainPositionsFromBroker(),
                                           CalculateDrawdownPercent(),
                                           g_consecutiveWins >= 2);
-                      RecordStateAction(state, decision.rlAction, positionTicket);
+                      RecordStateAction(state, decision.rlAction, positionId);
          }
          
          g_lastOrderTime = TimeCurrent();
@@ -3586,7 +3620,7 @@ void RecordClosedDealData(ulong dealTicket, double netProfit)
    FileClose(handle);
 }
 //+------------------------------------------------------------------+
-void RecordTrainingData(ulong positionTicket, ulong dealTicket, double netProfit, bool isWin)
+void RecordTrainingData(ulong positionId, ulong dealTicket, double netProfit, bool isWin)
 {
    // Shift array if full
    if(g_trainingDataCount >= INPUT_MAX_TRAINING_DATA)
@@ -3599,7 +3633,7 @@ void RecordTrainingData(ulong positionTicket, ulong dealTicket, double netProfit
    int idx = g_trainingDataCount;
    g_trainingDataCount++;
    
-     g_trainingData[idx].ticket = positionTicket;
+      g_trainingData[idx].ticket = positionId;
    g_trainingData[idx].closeTime = TimeCurrent();
    g_trainingData[idx].profitLoss = netProfit;
    g_trainingData[idx].isWin = isWin;
@@ -3615,7 +3649,7 @@ void RecordTrainingData(ulong positionTicket, ulong dealTicket, double netProfit
    
    for(int i = 0; i < g_positionCount; i++)
    {
-           if(g_positions[i].ticket == positionTicket)
+           if(g_positions[i].ticket == positionId)
       {
          g_trainingData[idx].signalCombination = g_positions[i].signalCombination;
          g_trainingData[idx].confidenceAtEntry = g_positions[i].confidenceAtEntry;
@@ -3635,7 +3669,7 @@ void RecordTrainingData(ulong positionTicket, ulong dealTicket, double netProfit
       RecalculateCombinationStats();
          if(INPUT_ENABLE_LOGGING)
       Print("TRAINING DATA: DealTicket=", dealTicket,
-            " | PositionTicket=", positionTicket,
+                       " | PositionId=", positionId,
             " | NetPnl=", netProfit);
 }
 //+------------------------------------------------------------------+
